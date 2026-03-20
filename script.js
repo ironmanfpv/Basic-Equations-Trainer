@@ -435,7 +435,7 @@ const app = {
         const hasBrackets = /[\(\[\{]/.test(lastVal);
         if (hasBrackets) {
             return {
-                question: "Expand the bracketed terms and simplify.",
+                question: "Continue solving. If there are fractional terms in your equation, prioritise finding the LCM of the denominators and compensating the numerators with factors. Otherwise, work on expansion to get terms.",
                 type: 'equation'
             };
         } else {
@@ -485,7 +485,16 @@ const app = {
             const lastVal = prevStep ? prevStep.submittedVal : p.expression;
             const finalAnswer = p.targetSteps.find(s => s.type === 'final' || s.type === '__dynamic__')?.answer
                 ?? this.fullySimplify(p.expression);
-            targetDescriptor = this.nextDynamicStep(lastVal, finalAnswer);
+
+            // Custom Step 1 prompt: analysis & planning step
+            if (stepCount === 1) {
+                targetDescriptor = {
+                    question: "Analyse the given equation. Determine if it is a linear, fractional or quadratic equation. Then plan out your solving steps.",
+                    type: 'equation'
+                };
+            } else {
+                targetDescriptor = this.nextDynamicStep(lastVal, finalAnswer);
+            }
             // Overwrite the sentinel with the resolved descriptor so subsequent
             // re-renders of the same slot are consistent.
             p.targetSteps[stepCount - 1] = targetDescriptor;
@@ -597,6 +606,7 @@ const app = {
             const targetAns = target ? target.answer : (p.targetSteps[p.targetSteps.length - 1]?.answer || '');
             isCorrect = this.compareExpressions(val, targetAns);
             if (!isCorrect && hints) {
+                row.classList.add('error');  // ensure red border before early return
                 this.renderTermHighlightError(val, targetAns, previewEl, hintEl);
                 return;
             } else if (!isCorrect) {
@@ -609,6 +619,7 @@ const app = {
             if (!val.includes('=')) {
                 hintEl.innerHTML = "Remember to include an '=' sign in your equation step!";
             } else {
+                row.classList.add('error');  // ensure red border before early return
                 this.renderTermHighlightError(val, p.expression, previewEl, hintEl); return;
             }
             hintEl.style.display = 'block';
@@ -707,14 +718,20 @@ const app = {
                     const matches = getTermMatches(uInfo[0].terms, tInfo[0].terms, r) +
                         getTermMatches(uInfo[1].terms, tInfo[1].terms, r);
 
-                    const isBetter = (minE > 0 && errs === 0) ||
-                        (minE > 0 && errs > 0 && matches > maxMatches) ||
-                        (minE > 0 && errs > 0 && matches === maxMatches && errs < minE) ||
-                        (minE === 0 && errs === 0 && matches > maxMatches);
+                    // Priority order for ratio selection:
+                    //   1. Most term-level matches  (a ratio that matches more correct terms IS more correct)
+                    //   2. Fewest category-level errors  (secondary, for zero-match tie-breaking)
+                    //   3. Ratio closest to 1  (avoids pathological scaled ratios derived from wrong terms)
+                    //
+                    // Crucially, matches must come FIRST. When the user makes errors on multiple terms,
+                    // a pathological ratio (e.g. 21.4 derived from a wrong coefficient) can zero out
+                    // MORE category errors than ratio=1 while matching ZERO actual terms. Always rank
+                    // the ratio that identifies the most genuine correct terms highest.
+                    const isBetter =
+                        matches > maxMatches ||
+                        (matches === maxMatches && errs < minE) ||
+                        (matches === maxMatches && errs === minE && Math.abs(r - 1) < Math.abs(bestR - 1));
                     if (isBetter) { minE = errs; maxMatches = matches; bestR = r; }
-                    else if (errs === minE && matches === maxMatches) {
-                        if (Math.abs(r - 1) < Math.abs(bestR - 1)) bestR = r;
-                    }
                 }
                 ratio = bestR;
             }
@@ -734,35 +751,110 @@ const app = {
                 const uTerms = uInfo[sideIdx].terms;
 
                 if (!hasBrackets) {
-                    // Rule 1: Refined Categorical flagging for Expanded Form
-                    // Match terms exactly first. Residual terms in wrong categories are red.
-                    const tTerms = [...tInfo[sideIdx].terms];
-                    const res = uTerms.map(ut => ({ ...ut, correct: false }));
-                    const consumed = new Array(tTerms.length).fill(false);
+                    // ── FULLY-EXPANDED CATEGORY-SUM CHECK ──────────────────────────────
+                    // When no brackets remain in the user's equation every term is a pure
+                    // monomial. We compare the net coefficient of each category
+                    // (LHS − RHS) for user vs target, flag any category whose net sum
+                    // is wrong, and colour ALL terms in that category red.
+                    //
+                    // Key: we derive our OWN ratio here by minimising error-count alone
+                    // (matches are NOT used as a primary criterion). This prevents the
+                    // shared `ratio` — which was chosen to maximise term-level matches
+                    // against bracketed target terms — from corrupting the result.
+                    // ───────────────────────────────────────────────────────────────────
 
-                    // Phase A: Greedy Exact term-to-term matches (Protects correct work)
-                    res.forEach(u => {
-                        const idx = tTerms.findIndex((t, j) => !consumed[j] && this.compareCoefficientMaps(u.totals, t.totals, ratio));
-                        if (idx !== -1) { u.correct = true; consumed[idx] = true; }
+                    // Net totals: LHS aggregate minus RHS aggregate for each category
+                    const uNet = {}, tNet = {};
+                    allSigs.forEach(s => {
+                        uNet[s] = (uInfo[0].agg[s] || 0) - (uInfo[1].agg[s] || 0);
+                        tNet[s] = (tInfo[0].agg[s] || 0) - (tInfo[1].agg[s] || 0);
                     });
 
-                    // Phase B: Categorical check for leftovers
-                    return res.map(ut => {
-                        if (ut.correct) return ut;
+                    // ── TARGET-HAS-BRACKETS CORRECTION ───────────────────────────────────
+                    // When the user types a fully expanded step (no brackets) but the
+                    // target equation still contains rational/fractional expressions, the
+                    // getCategoryTotals call above fits a quadratic through 3 sample points
+                    // of each rational term.  For a term like 3/[2(x-5)] those sample
+                    // values are tiny floats (~0.07), producing completely wrong tNet
+                    // entries (e.g. {x²:-0.015, x:-0.064, const:-0.299}) and a spurious
+                    // 'x²' signature in allSigs.  Using those in the ratio selection picks
+                    // a bogus ratio that flags the correct 'x' term red while leaving the
+                    // genuinely wrong constant white.
+                    //
+                    // Correct approach: use extractNumeratorCoeffs to get the actual
+                    // polynomial numerator of (targetLHS − targetRHS) after clearing all
+                    // denominators.  That gives the true cross-multiplied polynomial (e.g.
+                    // 8x − 46 for this target), whose coefficients are the real tNet values.
+                    // ─────────────────────────────────────────────────────────────────────
+                    const targetHasBrackets = /[\(\[\{]/.test(targetVal);
+                    if (targetHasBrackets) {
+                        const tParts = targetVal.split('=');
+                        if (tParts.length === 2) {
+                            const tPoly = this.extractNumeratorCoeffs(
+                                `(${tParts[0]}) - (${tParts[1]})`);
+                            if (tPoly) {
+                                // Wipe the bogus entries and replace with polynomial truth
+                                Object.keys(tNet).forEach(k => { tNet[k] = 0; });
+                                if (Math.abs(tPoly.a) > 1e-9) tNet['x^2'] = tPoly.a;
+                                if (Math.abs(tPoly.b) > 1e-9) tNet['x']   = tPoly.b;
+                                if (Math.abs(tPoly.c) > 1e-9) tNet['const'] = tPoly.c;
+                            }
+                        }
+                    }
+
+                    // Build expSigs from the ACTUAL non-zero entries of uNet and tNet.
+                    // Do NOT use allSigs: it may still carry spurious 'x²' entries from
+                    // the rational-function approximation of bracketed target terms.
+                    const expSigs = new Set([
+                        ...Object.keys(uNet).filter(s => Math.abs(uNet[s]) > 1e-9),
+                        ...Object.keys(tNet).filter(s => Math.abs(tNet[s]) > 1e-9)
+                    ]);
+
+                    // Derive expandedRatio: ratio that leaves the fewest categories wrong.
+                    // Ties broken by proximity to 1.
+                    const expRatioCands = new Set([1, -1]);
+                    expSigs.forEach(s => {
+                        if (Math.abs(tNet[s] || 0) > 1e-9)
+                            expRatioCands.add((uNet[s] || 0) / tNet[s]);
+                    });
+                    let expandedRatio = 1, minExpErrs = Infinity;
+                    for (const r of expRatioCands) {
+                        if (!isFinite(r) || Math.abs(r) < 1e-6) continue;
+                        let errs = 0;
+                        expSigs.forEach(s => {
+                            if (Math.abs((uNet[s] || 0) - (tNet[s] || 0) * r) > 1e-6) errs++;
+                        });
+                        const isBetter = errs < minExpErrs ||
+                            (errs === minExpErrs && Math.abs(r - 1) < Math.abs(expandedRatio - 1));
+                        if (isBetter) { minExpErrs = errs; expandedRatio = r; }
+                    }
+
+                    // Flag categories whose net sum doesn't match at expandedRatio
+                    const catErrorSigs = new Set();
+                    expSigs.forEach(s => {
+                        if (Math.abs((uNet[s] || 0) - (tNet[s] || 0) * expandedRatio) > 1e-6)
+                            catErrorSigs.add(s);
+                    });
+
+                    // Colour every term by its primary category
+                    return uTerms.map(ut => {
                         const cat = this.getPrimaryCategory(ut.totals);
-                        const isIncorrect = errorSigs.has(cat);
-                        return { ...ut, correct: !isIncorrect };
+                        return { ...ut, correct: !catErrorSigs.has(cat) };
                     });
                 }
 
-                // Rule 2: Precision flagging for Unexpanded Terms (with brackets)
+                // ── UNEXPANDED: Precision flagging for terms still containing brackets ──
                 const tTerms = [...tInfo[sideIdx].terms]; // clone to consume
                 const res = uTerms.map(ut => ({ ...ut, correct: false }));
                 const consumed = new Array(tTerms.length).fill(false);
 
-                // Phase A: Greedy Exact term-to-term matches
+                // Phase A: Greedy Exact term-to-term matches (ALWAYS at ratio=1).
+                // A user term is correct only when its polynomial coefficients are
+                // identical to a target term's — never at a scaled ratio.  Using the
+                // global ratio here causes sign-flipped or coefficient-scaled terms to
+                // appear "correct" (e.g. -3(x-3)/4 matching 3(x-3)/4 at ratio=-1).
                 res.forEach(u => {
-                    const idx = tTerms.findIndex((t, j) => !consumed[j] && this.compareCoefficientMaps(u.totals, t.totals, ratio));
+                    const idx = tTerms.findIndex((t, j) => !consumed[j] && this.compareCoefficientMaps(u.totals, t.totals, 1));
                     if (idx !== -1) { u.correct = true; consumed[idx] = true; }
                 });
 
@@ -774,16 +866,20 @@ const app = {
                 const resErrSigs = new Set();
                 allSigs.forEach(s => { if (Math.abs((uResAgg[s] || 0) - (tResAgg[s] || 0)) > 1e-6) resErrSigs.add(s); });
 
-                // Final mark: any unmatched term contributing to a mismatched residue IS an error
+                // Final mark: any unmatched term that contributes to the residual mismatch IS an error.
+                // We use only resErrSigs (the local side-level residual) here, NOT the global errorSigs,
+                // because errorSigs is derived from the global ratio which could be polluted when there
+                // are errors on both LHS and RHS simultaneously.
                 res.forEach(u => {
                     if (u.correct) return;
                     let contributesToErr = false;
                     const totalsKeys = Object.keys(u.totals);
                     if (totalsKeys.length === 0) {
-                        if (errorSigs.size > 0) contributesToErr = true;
+                        // Term with no detectable polynomial signature – flag if ANY residual error exists
+                        if (resErrSigs.size > 0) contributesToErr = true;
                     } else {
                         for (let s in u.totals) {
-                            if (errorSigs.has(s) && resErrSigs.has(s)) { contributesToErr = true; break; }
+                            if (resErrSigs.has(s)) { contributesToErr = true; break; }
                         }
                     }
                     if (!contributesToErr) u.correct = true;
