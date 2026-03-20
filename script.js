@@ -426,10 +426,58 @@ const app = {
         return count;
     },
 
-    nextDynamicStep(lastVal, finalAns) {
+    /* ── Detects (ax+b)(cx+d) = 0 where a and c are both non-zero ── */
+    isFactorisedQuadraticZero(val) {
+        if (!val) return false;
+        const s = val.replace(/\s+/g, '');
+        
+        const eqParts = s.split('=');
+        if (eqParts.length !== 2) return false;
+        
+        // Determine which side is '0' and which side is the factors
+        let factorsPart = null;
+        if (eqParts[1].trim() === '0') {
+            factorsPart = eqParts[0].trim();
+        } else if (eqParts[0].trim() === '0') {
+            factorsPart = eqParts[1].trim();
+        } else {
+            return false;
+        }
+
+        // The factors part must be a product of exactly two linear factors (brackets)
+        // Pattern: (ax+b)(cx+d)
+        // We use a regex that matches two consecutive bracketed groups with nothing outside
+        const factorPattern = /^\(([^()]+)\)\(([^()]+)\)$/;
+        const m = factorsPart.match(factorPattern);
+        if (!m) return false;
+        const factor1 = m[1]; // e.g. "ax+b" or "ax-b"
+        const factor2 = m[2];
+        // Each factor must be linear in x: presence of 'x' with a numeric leading coeff
+        // Normalize and check that it is a degree-1 polynomial in x
+        const isLinearInX = (f) => {
+            const norm = this.normalizeMathExpression(f);
+            try {
+                const coeffs = this.extractNumeratorCoeffs(norm);
+                if (!coeffs) return false;
+                // Degree 1: b (x^2 coeff) ~0, a (x coeff) non-zero
+                return Math.abs(coeffs.a) < 1e-9 && Math.abs(coeffs.b) > 1e-9;
+            } catch(e) { return false; }
+        };
+        return isLinearInX(factor1) && isLinearInX(factor2);
+    },
+
+    nextDynamicStep(lastVal, finalAns, prevStepCorrect) {
         // If the user has already typed "x = ...", we are done (this shouldn't happen via addStep but good to be safe)
         if (this.isSolvedFormat(lastVal)) {
             return { question: "Equation solved!", type: 'final', answer: finalAns };
+        }
+
+        // If previous step was correct AND was a factorised quadratic = 0, give tailored root-extraction prompt
+        if (prevStepCorrect && this.isFactorisedQuadraticZero(lastVal)) {
+            return {
+                question: "Now that you have successfully solved the quadratic equation by factorisation, extract the roots and type them in the format x = a, b where a and b are your solutions.",
+                type: 'equation'
+            };
         }
 
         const hasBrackets = /[\(\[\{]/.test(lastVal);
@@ -440,7 +488,7 @@ const app = {
             };
         } else {
             return {
-                question: "Collect like terms, simplify and solve. Quadratic equations should simplify to the form ax^2 + bx + c = 0 to solve. Multiple x solutions should be typed as x = a, b",
+                question: "Collect like terms, simplify and solve. Quadratic equations simplify to ax^2 +bx +c = 0 to solve. Multiple x solutions should be typed as x = a, b",
                 type: 'equation'
             };
         }
@@ -483,6 +531,7 @@ const app = {
             // Find the last correctly answered non-count step value.
             const prevStep = [...this.steps].reverse().find(s => s.correct && s.submittedVal);
             const lastVal = prevStep ? prevStep.submittedVal : p.expression;
+            const prevStepCorrect = !!(prevStep && prevStep.correct);
             const finalAnswer = p.targetSteps.find(s => s.type === 'final' || s.type === '__dynamic__')?.answer
                 ?? this.fullySimplify(p.expression);
 
@@ -493,7 +542,7 @@ const app = {
                     type: 'equation'
                 };
             } else {
-                targetDescriptor = this.nextDynamicStep(lastVal, finalAnswer);
+                targetDescriptor = this.nextDynamicStep(lastVal, finalAnswer, prevStepCorrect);
             }
             // Overwrite the sentinel with the resolved descriptor so subsequent
             // re-renders of the same slot are consistent.
@@ -1196,7 +1245,9 @@ const app = {
 
 
     isSolvedFormat(str) {
-        // More robust solved format detection
+        // Strict solved format: x = {plain numeric}  OR  x = {plain numeric}, {plain numeric}
+        // Each solution on the RHS must be a PLAIN number or simple fraction (no operators other than
+        // a leading minus sign and a single division slash). Expressions like "-5 + 4" are NOT final.
         const s = str.replace(/\s+/g, '');
         if (!s.toLowerCase().startsWith('x=')) return false;
 
@@ -1204,10 +1255,12 @@ const app = {
             const rhs = s.split('=')[1];
             if (!rhs) return false;
             const solutions = rhs.split(',');
-            // Each solution must be a valid numeric expression (simplified fraction or number)
             for (let sol of solutions) {
-                const val = math.evaluate(this.normalizeMathExpression(sol));
-                if (typeof val !== 'number' && !(val && val.isComplex)) return false;
+                // Allow only: optional leading minus, digits, optional single '/' with digits
+                // e.g. "-3", "5", "-1/2", "3/4"
+                // Reject anything containing +, *, ^, letters, or extra operators
+                const clean = sol.trim();
+                if (!/^-?\d+(\/\d+)?$/.test(clean)) return false;
             }
             return true;
         } catch (e) { return false; }
